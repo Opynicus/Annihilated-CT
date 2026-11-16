@@ -1,0 +1,423 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45">
+<CheatEntries>
+<CheatEntry><ID>1</ID><Description>"Open HP, Sanity and Curse Editor (Connect / Read / Edit)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not AnnihilatedHP then error("Allow this table Lua script to run, then reopen the table.") end
+AnnihilatedHP.show()
+{$asm}
+[DISABLE]
+</AssemblerScript></CheatEntry>
+</CheatEntries>
+<LuaScript>-- Annihilated, IL2CPP build BD28A4A7603095FD41AB81C2A0929E54.
+-- Embedded in the .CT; no external Lua file is needed by the delivered table.
+-- Only the main-thread bridge calls SetVariableValue. No string is edited in place.
+if AnnihilatedHP then
+  AnnihilatedHP.disconnect()
+  if AnnihilatedHP.timer then AnnihilatedHP.timer.destroy() end
+  if AnnihilatedHP.form then AnnihilatedHP.form.destroy() end
+end
+local M = { fields={}, ordered={}, cache={}, connected=false }
+AnnihilatedHP = M
+local UPDATE, SETTER, STRING_NEW, TYPEINFO = 0xAB7E50, 0xAA7460, 0x42EB30, 68500488
+local SANITY_FILTER = 0x55FCE0
+local SANITY_ORIGINAL = {0x48,0x89,0x5C,0x24,0x08}
+local ORIGINAL = {0x48,0x8B,0x49,0x20,0x48,0x85,0xC9}
+local EXPECTED_MD5 = 'bd28a4a7603095fd41ab81c2a0929e54'
+local function hex(n) return string.format('%X', n) end
+local function pointer(a) return readQword(a) or 0 end
+local function text(p)
+  if not p or p==0 then return nil end
+  local n=readInteger(p+0x10)
+  if not n or n&lt;0 or n&gt;2048 then return nil end
+  if n==0 then return '' end
+  return readString(p+0x14, n*2, true)
+end
+local function sameBytes(address, expected)
+  local actual=readBytes(address,#expected,true)
+  if not actual then return false end
+  for i=1,#expected do if expected[i]~=actual[i] then return false end end
+  return true
+end
+local function put(ok) if not ok then error('Write failed. Check Cheat Engine process access.') end end
+local function fieldName(s)
+  return s=='playerHealth' or s=='playerMaxHealth' or s=='partnerHealth' or s=='partnerMaxHealth'
+    or s=='playerSanity' or s=='partnerSanity' or s=='curse'
+    or (s and (s:match('^enemy%d+Health$') or s:match('^enemy%d+MaxHealth$')))
+end
+local function order(s)
+  local known={playerHealth=1,playerMaxHealth=2,playerSanity=3,partnerHealth=4,partnerMaxHealth=5,partnerSanity=6,curse=7}
+  return known[s] or (10+tonumber(s:match('enemy(%d+)'))*2+(s:find('Max') and 1 or 0))
+end
+function M.status(s) M.message=s; if M.statusLabel then M.statusLabel.Caption=s end end
+function M.checkProcess()
+  if not M.pid or getOpenedProcessID()~=M.pid or getProcessIDFromProcessName('Annihilated.exe')~=M.pid then
+    error('The game exited or CE switched targets. Reconnect to Annihilated.exe.')
+  end
+end
+function M.readFields(manager, force)
+  if pointer(manager)~=M.klass then return nil end
+  local map=pointer(manager+0x38)
+  local dict=map~=0 and pointer(map+0x20) or 0
+  local entries=dict~=0 and pointer(dict+0x18) or 0
+  local count=dict~=0 and readInteger(dict+0x20) or nil
+  if entries==0 or not count or count&lt;1 or count&gt;20000 then return nil end
+  local capacity=pointer(entries+0x18)
+  if capacity&lt;count or capacity&gt;50000 then return nil end
+  local version=readInteger(dict+0x2C)
+  -- Re-enumerate keys after load, resize or dictionary mutation.
+  if force or M.cache.entries~=entries or M.cache.version~=version or M.cache.manager~=manager then
+    local fields={}
+    for i=0,count-1 do
+      local at=entries+0x20+i*24
+      local hash=readInteger(at)
+      if hash and hash&lt;0x80000000 then
+        local keyPtr=pointer(at+8)
+        local key=text(keyPtr)
+        if fieldName(key) then fields[key]={name=key,index=i,key=keyPtr,slot=at+16} end
+      end
+    end
+    M.cache={entries=entries,version=version,manager=manager,fields=fields}
+  end
+  local fields=M.cache.fields
+  if not fields.playerHealth then return nil end
+  for _,f in pairs(fields) do f.object=pointer(f.slot); f.value=text(f.object) end
+  return fields
+end
+function M.locate()
+  M.klass=pointer(M.base+TYPEINFO)
+  if M.klass&lt;0x10000 then error('Variables are not initialized. Load a save first.') end
+  if M.manager and M.readFields(M.manager,true) then return M.manager end
+  local v=M.klass; local bytes={}
+  for i=1,8 do bytes[i]=string.format('%02X', v &amp; 0xFF); v=v &gt;&gt; 8 end
+  local found=AOBScan(table.concat(bytes,' '), '+W-C', 1, '8')
+  if not found then error('No variable map found. Enter the game first.') end
+  local candidates={}
+  for i=0,found.Count-1 do
+    local at=tonumber(found[i],16)
+    local ok,fields=pcall(M.readFields,at,true)
+    if ok and fields and tonumber(fields.playerHealth.value) then candidates[#candidates+1]=at end
+  end
+  found.destroy()
+  if #candidates~=1 then error('Found '..#candidates..' valid variable maps. Load a save and reconnect.') end
+  return candidates[1]
+end
+function M.installBridge()
+  if M.bridge and M.bridge.pid==M.pid then
+    if sameBytes(M.base+UPDATE,M.bridge.patch) and sameBytes(M.base+SANITY_FILTER,M.bridge.sanityPatch) then return end
+    error('The write handler has changed. Restart the game and reconnect.')
+  end
+  if not sameBytes(M.base+UPDATE,ORIGINAL) then error('The Update handler was modified by another tool. Disconnect that tool first.') end
+  if not sameBytes(M.base+SANITY_FILTER,SANITY_ORIGINAL) then error('The sanity handler was modified by another tool. Disconnect that tool first.') end
+  local asm=([[
+[ENABLE]
+define(target,%s)
+define(setter,%s)
+define(newstring,%s)
+define(sanityfilter,%s)
+assert(target,48 8B 49 20 48 85 C9)
+assert(sanityfilter,48 89 5C 24 08)
+alloc(anhp_bridge,1000,target)
+label(anhp_return)
+label(anhp_original)
+label(anhp_failure)
+label(anhp_restore)
+label(anhp_state)
+label(anhp_manager)
+label(anhp_class)
+label(anhp_key)
+label(anhp_text)
+label(anhp_sanity_override)
+label(anhp_sanity_hook)
+label(anhp_sanity_original)
+registersymbol(anhp_state)
+registersymbol(anhp_manager)
+registersymbol(anhp_class)
+registersymbol(anhp_key)
+registersymbol(anhp_text)
+registersymbol(anhp_sanity_override)
+anhp_bridge:
+  pushfq
+  cmp dword ptr [anhp_state],1
+  jne anhp_original
+  push rax
+  push rcx
+  push rdx
+  push r8
+  push r9
+  push r10
+  push r11
+  sub rsp,88
+  movdqu [rsp+20],xmm0
+  movdqu [rsp+30],xmm1
+  movdqu [rsp+40],xmm2
+  movdqu [rsp+50],xmm3
+  movdqu [rsp+60],xmm4
+  movdqu [rsp+70],xmm5
+  mov eax,1
+  mov edx,2
+  lock cmpxchg [anhp_state],edx
+  jne anhp_restore
+  mov rcx,[anhp_manager]
+  test rcx,rcx
+  je anhp_failure
+  mov rax,[anhp_class]
+  cmp [rcx],rax
+  jne anhp_failure
+  cmp qword ptr [rcx+40],0
+  jne anhp_failure
+  lea rcx,[anhp_text]
+  call newstring
+  test rax,rax
+  je anhp_failure
+  mov r8,rax
+  mov rcx,[anhp_manager]
+  mov rdx,[anhp_key]
+  xor r9d,r9d
+  call setter
+  mov dword ptr [anhp_state],3
+  jmp anhp_restore
+anhp_failure:
+  mov dword ptr [anhp_state],FFFFFFFF
+anhp_restore:
+  movdqu xmm0,[rsp+20]
+  movdqu xmm1,[rsp+30]
+  movdqu xmm2,[rsp+40]
+  movdqu xmm3,[rsp+50]
+  movdqu xmm4,[rsp+60]
+  movdqu xmm5,[rsp+70]
+  add rsp,88
+  pop r11
+  pop r10
+  pop r9
+  pop r8
+  pop rdx
+  pop rcx
+  pop rax
+anhp_original:
+  popfq
+  mov rcx,[rcx+20]
+  test rcx,rcx
+  jmp anhp_return
+// Bypass only the fixed-sanity normalizer for this explicit queued write.
+// All ordinary game writes and all other variable filters keep their normal behavior.
+anhp_sanity_hook:
+  pushfq
+  cmp dword ptr [anhp_state],2
+  jne anhp_sanity_original
+  cmp dword ptr [anhp_sanity_override],1
+  jne anhp_sanity_original
+  cmp rdx,[anhp_key]
+  jne anhp_sanity_original
+  popfq
+  mov rax,r8
+  ret
+anhp_sanity_original:
+  popfq
+  mov [rsp+08],rbx
+  jmp sanityfilter+5
+align 10
+anhp_state:
+  dd 0
+anhp_sanity_override:
+  dd 0
+align 8
+anhp_manager:
+  dq 0
+anhp_class:
+  dq 0
+anhp_key:
+  dq 0
+anhp_text:
+  db 0
+target:
+  jmp anhp_bridge
+  nop 2
+anhp_return:
+sanityfilter:
+  jmp anhp_sanity_hook
+[DISABLE]
+target:
+  db 48 8B 49 20 48 85 C9
+sanityfilter:
+  db 48 89 5C 24 08
+// Leave the single inert page allocated until process exit, avoiding an in-flight return race.
+unregistersymbol(anhp_state)
+unregistersymbol(anhp_manager)
+unregistersymbol(anhp_class)
+unregistersymbol(anhp_key)
+unregistersymbol(anhp_text)
+unregistersymbol(anhp_sanity_override)
+]]):format(hex(M.base+UPDATE),hex(M.base+SETTER),hex(M.base+STRING_NEW),hex(M.base+SANITY_FILTER))
+  local ok,di=autoAssemble(asm)
+  if not ok then error('Could not install the write handler: '..tostring(di)) end
+  M.bridge={pid=M.pid,asm=asm,di=di,patch=readBytes(M.base+UPDATE,7,true),sanityPatch=readBytes(M.base+SANITY_FILTER,5,true),
+    state=getAddress('anhp_state'),manager=getAddress('anhp_manager'),klass=getAddress('anhp_class'),
+    key=getAddress('anhp_key'),buffer=getAddress('anhp_text'),sanityOverride=getAddress('anhp_sanity_override')}
+end
+function M.refresh(force)
+  M.checkProcess()
+  local fields=M.readFields(M.manager,force)
+  if not fields then error('The variable map changed. Click Rescan.') end
+  M.fields=fields
+  local names={}; for k in pairs(fields) do names[#names+1]=k end
+  table.sort(names,function(a,b) return order(a)&lt;order(b) end)
+  local changed=table.concat(names,',')~=table.concat(M.ordered,',')
+  M.ordered=names
+  if M.list then
+    if changed then
+      M.list.Items.clear(); M.selector.Items.clear()
+      for _,name in ipairs(names) do
+        local item=M.list.Items.add(); item.Caption=name; item.SubItems.add(fields[name].value or '?')
+        M.selector.Items.add(name)
+      end
+      M.selector.ItemIndex=0
+      M.valueEdit.Text=fields[names[1]].value or ''
+    else
+      for i,name in ipairs(names) do M.list.Items[i-1].SubItems[0]=fields[name].value or '?' end
+    end
+  end
+  return fields
+end
+function M.connect()
+  local pid=getProcessIDFromProcessName('Annihilated.exe')
+  if not pid or pid==0 then error('Start Annihilated.exe and load a save first.') end
+  if M.connected and pid==M.pid and getOpenedProcessID()==pid then M.refresh(true); M.timer.Enabled=true; return true end
+  if M.bridge then M.disconnect() end
+  openProcess(pid)
+  M.pid=pid; M.base=getAddressSafe('GameAssembly.dll')
+  if not M.base then error('GameAssembly.dll has not loaded yet.') end
+  local modulePath
+  for _,mod in ipairs(enumModules()) do if mod.Name:lower()=='gameassembly.dll' then modulePath=mod.PathToFile end end
+  if not modulePath or md5file(modulePath):lower()~=EXPECTED_MD5 then error('This table does not match the installed game version. Connection stopped.') end
+  if not sameBytes(M.base+SETTER,{0x40,0x53,0x55,0x41,0x54,0x41,0x57,0x48,0x83,0xEC,0x28}) then error('Write function verification failed.') end
+  M.manager=M.locate(); M.ordered={}; M.lastWrite=nil; M.refresh(true)
+  M.connected=true; M.timer.Enabled=true
+  M.status('Connected to Annihilated.exe (PID '..pid..'). Select a field and enter a value.')
+  return true
+end
+function M.requestWrite(name,input)
+  M.checkProcess(); if not M.connected then error('Connect to the game first.') end
+  if M.pending then error('The previous write is still pending.') end
+  local value=tostring(input):match('^%s*(.-)%s*$')
+  if not value:match('^%-?%d+$') then error('Enter a whole number.') end
+  local number=tonumber(value)
+  if not number or number &lt; -2147483648 or number &gt; 2147483647 then error('The value must fit in a signed 32-bit integer.') end
+  if name:find('MaxHealth',1,true) and number&lt;1 then error('Maximum HP must be at least 1.') end
+  value=string.format('%.0f',number)
+  local fields=M.refresh(true); local f=fields[name]
+  if not f or not fieldName(name) then error('This field is not available in the current state.') end
+  if pointer(M.manager+0x40)~=0 then error('The game is evaluating a preview. Try again shortly.') end
+  M.installBridge(); local b=M.bridge
+  if readInteger(b.state)==2 then error('The game is processing the previous request. Try again shortly.') end
+  put(writeInteger(b.state,0))
+  put(writeInteger(b.sanityOverride,(name=='playerSanity' or name=='partnerSanity') and 1 or 0))
+  put(writeQword(b.manager,M.manager)); put(writeQword(b.klass,M.klass)); put(writeQword(b.key,f.key))
+  put(writeString(b.buffer,value,false)); put(writeBytes(b.buffer+#value,0))
+  M.pending={name=name,before=f.value,desired=value,started=getTickCount()}
+  put(writeInteger(b.state,1))
+  M.status('Waiting for the next game frame: '..name..' = '..value)
+end
+function M.poll()
+  if not M.connected then return end
+  M.checkProcess()
+  if M.pending then
+    local state=readInteger(M.bridge.state)
+    if state==3 then
+      local task=M.pending; M.pending=nil; put(writeInteger(M.bridge.state,0))
+      M.refresh(true)
+      local actual=M.fields[task.name] and M.fields[task.name].value
+      M.lastWrite={name=task.name,before=task.before,desired=task.desired,actual=actual}
+      if actual~=task.desired then error('The game returned '..tostring(actual)..'; requested '..task.desired..'.') end
+      M.status('Updated '..task.name..': '..task.before..' -&gt; '..actual)
+    elseif state==0xFFFFFFFF or state==-1 then
+      M.pending=nil; put(writeInteger(M.bridge.state,0)); error('Preview is active or the variable map changed. Click Rescan.')
+    elseif getTickCount()-M.pending.started&gt;10000 and state==1 then
+      -- Claim cancellation atomically on the game thread would require another bridge command;
+      -- keep the single request pending so it cannot be silently requeued or overwritten.
+      M.status('Return to the game window to process the pending write. No duplicate request was sent.')
+    end
+  else M.refresh(false) end
+  if M.testStep then M.testStep() end
+end
+function M.disconnect()
+  if M.bridge and getProcessIDFromProcessName('Annihilated.exe')~=M.bridge.pid then M.bridge=nil end
+  if M.bridge then
+    if getOpenedProcessID()~=M.bridge.pid then error('Select Annihilated.exe in CE again before disconnecting the write handler.') end
+    local state=readInteger(M.bridge.state)
+    if state==1 or state==2 then error('A write is pending. Return to the game for a frame before disconnecting.') end
+    if sameBytes(M.base+UPDATE,M.bridge.patch) and sameBytes(M.base+SANITY_FILTER,M.bridge.sanityPatch) then
+      local ok,err=autoAssemble(M.bridge.asm,M.bridge.di)
+      if not ok then error('Could not restore the game handler: '..tostring(err)) end
+    elseif not sameBytes(M.base+UPDATE,ORIGINAL) or not sameBytes(M.base+SANITY_FILTER,SANITY_ORIGINAL) then error('A game handler was modified by another tool; its changes were not overwritten.') end
+    M.bridge=nil
+  end
+  if M.timer then M.timer.Enabled=false end
+  M.connected=false; M.pending=nil; M.manager=nil; M.cache={}
+  M.status('Disconnected. Game function entries restored.')
+end
+function M.guarded(fn)
+  return function(...)
+    local ok,err=pcall(fn,...)
+    if not ok then M.status(tostring(err)); showMessage(tostring(err)) end
+  end
+end
+function M.show() M.form.show() end
+
+local form=createForm(false); M.form=form
+form.Caption='Annihilated - HP, Sanity &amp; Curse Editor'
+form.Position='poScreenCenter'; form.Font.Name='Segoe UI'; form.Font.Size=10
+-- CE scales fonts with Windows DPI; scale manually positioned controls to match.
+local scale=math.max(1,math.abs(form.Font.Height)/14)
+local function U(n) return math.floor(n*scale+0.5) end
+form.Width=U(640); form.Height=U(510)
+local function label(caption,x,y,w)
+  local c=createLabel(form); c.Caption=caption; c.AutoSize=false; c.Left=U(x); c.Top=U(y); c.Width=U(w); c.Height=U(24); return c
+end
+local function button(caption,x,y,w,fn)
+  local c=createButton(form); c.Caption=caption; c.Left=U(x); c.Top=U(y); c.Width=U(w); c.Height=U(32); c.OnClick=M.guarded(fn); return c
+end
+label('Load a save &gt; Connect &gt; Select a field &gt; Apply',16,14,600)
+button('1. Connect',16,44,140,M.connect)
+button('Rescan',168,44,120,function()
+  M.checkProcess(); if M.pending then error('Wait for the pending write to finish.') end
+  M.manager=nil; M.cache={}; M.lastWrite=nil; M.manager=M.locate(); M.refresh(true); M.status('Located HP, sanity and curse fields in the current save.')
+end)
+button('Disconnect',300,44,90,M.disconnect)
+local list=createListView(form); M.list=list
+list.Left=U(16); list.Top=U(90); list.Width=U(590); list.Height=U(220)
+list.ViewStyle='vsReport'; list.RowSelect=true; list.ReadOnly=true; list.HideSelection=false
+local col=list.Columns.add(); col.Caption='Field'; col.Width=U(390)
+col=list.Columns.add(); col.Caption='Current value'; col.Width=U(150)
+list.OnClick=function()
+  if list.ItemIndex&gt;=0 then M.selector.ItemIndex=list.ItemIndex; M.valueEdit.Text=M.fields[M.ordered[list.ItemIndex+1]].value or '' end
+end
+local combo=createComboBox(form); M.selector=combo
+combo.Left=U(16); combo.Top=U(328); combo.Width=U(330); combo.Style='csDropDownList'
+local edit=createEdit(form); M.valueEdit=edit; edit.Left=U(360); edit.Top=U(328); edit.Width=U(100)
+combo.OnChange=function() local name=M.ordered[combo.ItemIndex+1]; if name and M.fields[name] then edit.Text=M.fields[name].value or '' end end
+button('2. Apply',474,324,132,function()
+  local name=M.ordered[combo.ItemIndex+1]; if not name then error('Select a field first.') end
+  M.requestWrite(name,edit.Text)
+end)
+button('Full Player HP',16,368,140,function() M.requestWrite('playerHealth',M.fields.playerMaxHealth and M.fields.playerMaxHealth.value or '') end)
+button('Undo Last Write',168,368,150,function()
+  if not M.lastWrite then error('There is no successful write to undo.') end
+  M.requestWrite(M.lastWrite.name,M.lastWrite.before)
+end)
+M.statusLabel=label('Disconnected. Enter the game or load a save first.',16,416,590)
+M.statusLabel.Height=U(48); M.statusLabel.WordWrap=true
+M.timer=createTimer(form,false); M.timer.Interval=300
+M.timer.OnTimer=function()
+  local ok,err=pcall(M.poll)
+  if not ok then M.status(tostring(err)); M.timer.Enabled=false end
+end
+form.OnClose=function()
+  local ok,err=pcall(M.disconnect)
+  if not ok then M.status(tostring(err)); return caNone end
+  return caHide
+end
+M.show()
+</LuaScript>
+</CheatTable>
