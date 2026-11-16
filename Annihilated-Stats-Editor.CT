@@ -10,7 +10,7 @@ AnnihilatedHP.show()
 [DISABLE]
 </AssemblerScript></CheatEntry>
 </CheatEntries>
-<LuaScript>-- Annihilated, IL2CPP build BD28A4A7603095FD41AB81C2A0929E54.
+<LuaScript>-- Annihilated: select verified IL2CPP addresses for the installed game build.
 -- Embedded in the .CT; no external Lua file is needed by the delivered table.
 -- Only the main-thread bridge calls SetVariableValue. No string is edited in place.
 if AnnihilatedHP then
@@ -20,11 +20,19 @@ if AnnihilatedHP then
 end
 local M = { fields={}, ordered={}, cache={}, connected=false }
 AnnihilatedHP = M
-local UPDATE, SETTER, STRING_NEW, TYPEINFO = 0xAB7E50, 0xAA7460, 0x42EB30, 68500488
-local SANITY_FILTER = 0x55FCE0
+local BUILDS = {
+  ['bd28a4a7603095fd41ab81c2a0929e54'] = {
+    update=0xAB7E50, setter=0xAA7460, stringNew=0x42EB30,
+    typeInfo=0x4153C08, sanityFilter=0x55FCE0
+  },
+  ['e717e54e131f65fdecef8a98e6f0ee29'] = {
+    update=0xAD5CB0, setter=0xAC52C0, stringNew=0x4315E0,
+    typeInfo=0x41816C0, sanityFilter=0x5731C0
+  }
+}
+local UPDATE, SETTER, STRING_NEW, TYPEINFO, SANITY_FILTER
 local SANITY_ORIGINAL = {0x48,0x89,0x5C,0x24,0x08}
 local ORIGINAL = {0x48,0x8B,0x49,0x20,0x48,0x85,0xC9}
-local EXPECTED_MD5 = 'bd28a4a7603095fd41ab81c2a0929e54'
 local function hex(n) return string.format('%X', n) end
 local function pointer(a) return readQword(a) or 0 end
 local function text(p)
@@ -290,7 +298,11 @@ function M.connect()
   if not M.base then error('GameAssembly.dll has not loaded yet.') end
   local modulePath
   for _,mod in ipairs(enumModules()) do if mod.Name:lower()=='gameassembly.dll' then modulePath=mod.PathToFile end end
-  if not modulePath or md5file(modulePath):lower()~=EXPECTED_MD5 then error('This table does not match the installed game version. Connection stopped.') end
+  local buildHash=modulePath and md5file(modulePath):lower()
+  local build=buildHash and BUILDS[buildHash]
+  if not build then error('This table does not match the installed game version. Connection stopped.') end
+  UPDATE,SETTER,STRING_NEW,TYPEINFO,SANITY_FILTER=build.update,build.setter,build.stringNew,build.typeInfo,build.sanityFilter
+  M.build=build; M.buildHash=buildHash
   if not sameBytes(M.base+SETTER,{0x40,0x53,0x55,0x41,0x54,0x41,0x57,0x48,0x83,0xEC,0x28}) then error('Write function verification failed.') end
   M.manager=M.locate(); M.ordered={}; M.lastWrite=nil; M.refresh(true)
   M.connected=true; M.timer.Enabled=true
