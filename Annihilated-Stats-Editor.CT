@@ -107,7 +107,7 @@ AnnihilatedResolver = (function()
     local tw,dw,gw,pw=S.interfaces.stride-4,width(S.types.count),width(S.generic.count),width(S.params.count)
     need(tw==1 or tw==2 or tw==4,'unsupported type index width')
     need(S.types.stride==68+3*tw+gw and S.methods.stride==20+dw+tw+pw+gw and
-      S.fields.stride==8+tw and S.images.stride==32+2*dw,'unsupported v39 record layout')
+      S.fields.stride==8+tw and S.params.stride==8+tw and S.images.stride==32+2*dw,'unsupported v39 record layout')
     local M={version=version,types={},sections=S}
     function M.str(i)
       need(i&lt;S.strings.size,'invalid metadata string index')
@@ -141,7 +141,13 @@ AnnihilatedResolver = (function()
         local p=S.methods.off+i*S.methods.stride
         if M.str(uint(s,p,4))==name and uint(s,p+S.methods.stride-2,2)==argc then
           need(uint(s,p+4,dw)==t.index,'method owner mismatch')
-          found[#found+1]={name=name,token=uint(s,p+S.methods.stride-12,4)}
+          -- v39 stores a four-byte return-parameter token before parameterStart.
+          local start=uint(s,p+8+dw+tw,pw)
+          need(argc==0 or start+argc&lt;=S.params.count,'invalid parameter range')
+          local parameters={}
+          for j=0,argc-1 do parameters[#parameters+1]=uint(s,S.params.off+(start+j)*S.params.stride+8,tw) end
+          found[#found+1]={name=name,token=uint(s,p+S.methods.stride-12,4),
+            returns=uint(s,p+4+dw,tw),parameters=parameters,flags=uint(s,p+S.methods.stride-8,2)}
         end
       end
       return unique(found,'method '..t.name..'.'..name)
@@ -164,9 +170,12 @@ AnnihilatedResolver = (function()
     local behaviour=M.type(runtime,'Naninovel','RuntimeBehaviour')
     local filter=M.type('Assembly-CSharp.dll','','CustomVariablePostProcessorService')
     local result={version=M.version,stamp=P.stamp,imageSize=P.size,peHeader=P.header,checks={},layout={}}
-    local modules={}
-    local function method(t,name,argc)
-      local token=M.method(t,name,argc).token; local rid=token &amp; 0xFFFFFF
+    local modules,signatures={},{}
+    local function method(t,name,args,returns)
+      local definition=M.method(t,name,#args)
+      need(definition.flags &amp; 0x10 == 0,'expected an instance method: '..name)
+      signatures[#signatures+1]={definition=definition,args=args,returns=returns}
+      local token=definition.token; local rid=token &amp; 0xFFFFFF
       need(token&gt;&gt;24==6 and rid&gt;0,'invalid method token')
       if not modules[t.image] then
         local candidates={}
@@ -193,9 +202,9 @@ AnnihilatedResolver = (function()
       result.checks[#result.checks+1]={rva=tableRVA,pointerRVA=address}
       return address
     end
-    result.update=method(behaviour,'Update',0)
-    result.setter=method(manager,'SetVariableValue',2)
-    result.sanityFilter=method(filter,'NormalizeFixedPartnerSanityValue',2)
+    result.update=method(behaviour,'Update',{},1)
+    result.setter=method(manager,'SetVariableValue',{14,14},1)
+    result.sanityFilter=method(filter,'NormalizeFixedPartnerSanityValue',{14,14},14)
     result.stringNew=P.export('il2cpp_string_new')
     result.typeInfoCandidates={}
     for _,raw in ipairs(matches(binary,string.pack('&lt;I8',0x20000001 | (manager.byval&lt;&lt;1)),8)) do
@@ -214,12 +223,24 @@ AnnihilatedResolver = (function()
           P.raw(typesVA-P.base); P.raw(offsetsVA-P.base)
           local it=P.ptr(typesVA+manager.byval*8)
           need(P.ptr(it)==manager.index and (uint(binary,P.raw(it-P.base)+8,4)&gt;&gt;16)&amp;255==0x12,'type registration mismatch')
-          return {types=typesVA,offsets=offsetsVA}
+          return {types=typesVA,typesCount=typesCount,offsets=offsetsVA}
         end)
         if ok then regs[#regs+1]=reg end
       end
     end
     local reg=unique(regs,'metadata registration')
+    local function typeCode(index)
+      need(index&lt;reg.typesCount,'invalid signature type index')
+      local typeVA=P.ptr(reg.types+index*8)
+      return (uint(binary,P.raw(typeVA-P.base)+8,4)&gt;&gt;16)&amp;255
+    end
+    for _,signature in ipairs(signatures) do
+      local definition=signature.definition
+      need(typeCode(definition.returns)==signature.returns,'unsupported return type: '..definition.name)
+      for i,expected in ipairs(signature.args) do
+        need(typeCode(definition.parameters[i])==expected,'unsupported parameter type: '..definition.name)
+      end
+    end
     local function field(t,name)
       local found={}
       for _,f in ipairs(M.fields(t)) do if f.name==name then found[#found+1]=f end end
@@ -316,6 +337,122 @@ local function sameBytes(address, expected)
   return true
 end
 local function put(ok) if not ok then error('Write failed. Check Cheat Engine process access.') end end
+local function runtimeClass(namespace,name)
+  local klass=mono_findClass(namespace,name)
+  if not klass or klass==0 or mono_class_getName(klass)~=name or mono_class_getNamespace(klass)~=namespace then
+    error('Could not locate runtime class '..namespace..'.'..name..'. This game update may need a table update.')
+  end
+  return klass
+end
+local function verifyFields(klass,expected)
+  if not klass or klass==0 then error('Invalid runtime class while checking the variable layout.') end
+  local fields=mono_class_enumFields(klass,true)
+  if not fields then error('Could not read the runtime field layout.') end
+  for name,offset in pairs(expected) do
+    local matches=0
+    for _,field in ipairs(fields) do
+      if field.name==name and not field.isStatic and field.offset==offset then matches=matches+1 end
+    end
+    if matches~=1 then error('The game changed the layout of '..name..'. Writing is disabled; this table needs an update.') end
+  end
+end
+local function executableAddress(address,name)
+  if type(address)~='number' or address&lt;M.base or address&gt;=M.base+M.imageSize then
+    error('The runtime returned an invalid address for '..name..'.')
+  end
+  for _,section in ipairs(M.codeSections) do
+    if address&gt;=section.first and address&lt;section.last then return address end
+  end
+  error('The runtime address for '..name..' is not executable game code.')
+end
+local function runtimeMethod(klass,name,parameterTypes,returnType)
+  local methods=mono_class_enumMethods(klass,false)
+  if not methods then error('Could not enumerate runtime methods.') end
+  local matches={}
+  for _,method in ipairs(methods) do
+    if method.name==name and method.flags and (method.flags &amp; 0x10)==0 then
+      local signature=mono_method_get_parameters(method.method)
+      local valid=signature and signature.returntype==returnType and #signature.parameters==#parameterTypes
+      if valid then
+        for i,t in ipairs(parameterTypes) do if signature.parameters[i].type~=t then valid=false; break end end
+      end
+      if valid then matches[#matches+1]=method.method end
+    end
+  end
+  if #matches~=1 then error('Could not uniquely identify '..name..' with the required signature. Writing is disabled.') end
+  return executableAddress(mono_compile_method(matches[1]),name)
+end
+function M.discoverRuntime()
+  local required={'LaunchMonoDataCollector','mono_isil2cpp','mono_findClass','mono_class_getName',
+    'mono_class_getNamespace','mono_class_enumFields','mono_class_enumMethods','mono_method_get_parameters',
+    'mono_compile_method','mono_class_getArrayElementClass','mono_array_element_size'}
+  for _,name in ipairs(required) do
+    if type(_G[name])~='function' then error("Use a full 64-bit Cheat Engine installation with its built-in Mono/IL2CPP support.") end
+  end
+  M.status('Finding game classes and functions. Please wait...')
+  local loaded=LaunchMonoDataCollector()
+  local isIl2Cpp=loaded and loaded~=0 and mono_isil2cpp()
+  -- CE can retain an attached PID after its collector connection has gone stale.
+  -- Reset that CE-side connection once; a definite non-IL2CPP result is rejected.
+  if loaded and loaded~=0 and isIl2Cpp==nil and type(libmono)=='table' and type(libmono.terminate)=='function' then
+    libmono.terminate()
+    loaded=LaunchMonoDataCollector()
+    isIl2Cpp=loaded and loaded~=0 and mono_isil2cpp()
+  end
+  if not loaded or loaded==0 or not isIl2Cpp then error('Could not inspect the IL2CPP runtime. Load a save and reconnect; restart Cheat Engine if needed.') end
+  local peOffset=readInteger(M.base+0x3C)
+  if not peOffset or peOffset&lt;0x40 or peOffset&gt;0x1000 then error('Invalid GameAssembly module header.') end
+  local pe=M.base+peOffset
+  if readInteger(pe)~=0x4550 or readSmallInteger(pe+4)~=0x8664 or readSmallInteger(pe+24)~=0x20B then
+    error('This table requires a Windows x64 game build.')
+  end
+  M.imageSize=readInteger(pe+24+56)
+  local count,optionalSize=readSmallInteger(pe+6),readSmallInteger(pe+20)
+  if not M.imageSize or M.imageSize&lt;=0 or not count or count&lt;1 or count&gt;96 or not optionalSize then error('Invalid game code layout.') end
+  M.codeSections={}
+  for i=0,count-1 do
+    local at=pe+24+optionalSize+i*40
+    local size,rva,flags=readInteger(at+8),readInteger(at+12),readInteger(at+36)
+    if not size or not rva or not flags or rva+size&gt;M.imageSize then error('Invalid game section.') end
+    if (flags &amp; 0x20000000)~=0 then
+      M.codeSections[#M.codeSections+1]={first=M.base+rva,last=M.base+rva+size}
+    end
+  end
+  local manager=runtimeClass('Naninovel','CustomVariableManager')
+  local behaviour=runtimeClass('Naninovel','RuntimeBehaviour')
+  local normalizer=runtimeClass('','CustomVariablePostProcessorService')
+  verifyFields(manager,{localVariableMap=0x38,readOnlyEvaluationValues=0x40})
+  verifyFields(behaviour,{OnBehaviourUpdate=0x20})
+  verifyFields(runtimeClass('Naninovel','SerializableLiteralStringMap'),{dictionary=0x20})
+  verifyFields(runtimeClass('System','String'),{_stringLength=0x10,_firstChar=0x14})
+  -- IL2CPP type IDs: 1 = void, 14 = string. Require instance methods and exact signatures.
+  local update=runtimeMethod(behaviour,'Update',{},1)
+  local setter=runtimeMethod(manager,'SetVariableValue',{14,14},1)
+  local sanity=runtimeMethod(normalizer,'NormalizeFixedPartnerSanityValue',{14,14},14)
+  local stringNew=executableAddress(getAddressSafe('GameAssembly.il2cpp_string_new'),'il2cpp_string_new')
+  if not sameBytes(update,ORIGINAL) or not sameBytes(sanity,SANITY_ORIGINAL) then
+    error('The game function entries changed or another table modified them. Disconnect other tables; if this persists, an update is needed.')
+  end
+  M.klass=manager
+  UPDATE,SETTER,STRING_NEW,SANITY_FILTER=update-M.base,setter-M.base,stringNew-M.base,sanity-M.base
+  M.build={update=UPDATE,setter=SETTER,stringNew=STRING_NEW,sanityFilter=SANITY_FILTER,
+    peHeader=peOffset,stamp=readInteger(pe+8),imageSize=M.imageSize,
+    layout={managerMap=0x38,managerPreview=0x40,mapDictionary=0x20,dictEntries=0x18,dictCount=0x20,dictVersion=0x2C,entrySize=24}}
+  M.discovery='runtime'
+end
+function M.verifyContainers(manager)
+  local map=pointer(manager+0x38)
+  local dict=pointer(map+0x20)
+  local entries=pointer(dict+0x18)
+  if map==0 or dict==0 or entries==0 then error('The variable map is not initialized. Load a save first.') end
+  verifyFields(pointer(map),{dictionary=0x20})
+  verifyFields(pointer(dict),{_entries=0x18,_count=0x20,_version=0x2C})
+  local arrayClass=pointer(entries)
+  if mono_array_element_size(arrayClass)~=24 then error('The dictionary entry size changed. Writing is disabled.') end
+  local entryClass=mono_class_getArrayElementClass(arrayClass)
+  -- Metadata offsets include the boxed value-type header; array entries are unboxed.
+  verifyFields(entryClass,{hashCode=0x10,next=0x14,key=0x18,value=0x20})
+end
 local function fieldName(s)
   return s=='playerHealth' or s=='playerMaxHealth' or s=='partnerHealth' or s=='partnerMaxHealth'
     or s=='playerSanity' or s=='partnerSanity' or s=='curse'
@@ -335,6 +472,15 @@ end
 local function classIs(klass,name,namespace)
   return klass&gt;=0x10000 and readString(pointer(klass+0x10),128,false)==name
     and readString(pointer(klass+0x18),128,false)==namespace
+end
+local function classInherits(klass,name,namespace)
+  local seen={}
+  for depth=1,8 do
+    if klass&lt;0x10000 or seen[klass] then return false end
+    if classIs(klass,name,namespace) then return true end
+    seen[klass]=true; klass=pointer(klass+0x58)
+  end
+  return false
 end
 function M.checkProcess()
   if not M.pid or getOpenedProcessID()~=M.pid then
@@ -371,14 +517,55 @@ local function fieldOffsetsAgree(klass,expected)
   -- declared-field schema plus class/stride/content checks below are mandatory.
   return true
 end
+function M.readRuntimeFields(manager, force)
+  if pointer(manager)~=M.klass then return nil end
+  local map=pointer(manager+0x38)
+  local dict=map~=0 and pointer(map+0x20) or 0
+  local entries=dict~=0 and pointer(dict+0x18) or 0
+  local count=dict~=0 and readInteger(dict+0x20) or nil
+  if entries==0 or not count or count&lt;1 or count&gt;20000 then return nil end
+  local capacity=pointer(entries+0x18)
+  if capacity&lt;count or capacity&gt;50000 then return nil end
+  local version=readInteger(dict+0x2C)
+  -- Re-enumerate keys after load, resize or dictionary mutation.
+  if force or M.cache.dict~=dict or M.cache.count~=count or M.cache.entries~=entries or M.cache.version~=version or M.cache.manager~=manager then
+    local fields={}
+    for i=0,count-1 do
+      local at=entries+0x20+i*24
+      local hash=readInteger(at)
+      if hash and hash&gt;=0 and hash&lt;0x80000000 then
+        local keyPtr=pointer(at+8)
+        local key=text(keyPtr)
+        if fieldName(key) then
+          if fields[key] then return nil end
+          fields[key]={name=key,index=i,key=keyPtr,slot=at+16}
+        end
+      end
+    end
+    M.cache={dict=dict,count=count,entries=entries,version=version,manager=manager,fields=fields}
+  end
+  local fields=M.cache.fields
+  if not fields.playerHealth then return nil end
+  for _,f in pairs(fields) do
+    if pointer(f.slot-8)~=f.key or text(f.key)~=f.name then M.cache={}; return nil end
+    f.object=pointer(f.slot); f.value=text(f.object)
+  end
+  if not fields.playerMaxHealth or not fields.playerSanity or not fields.curse
+    or not tonumber(fields.playerHealth.value) or not tonumber(fields.playerMaxHealth.value)
+    or not tonumber(fields.playerSanity.value) or not tonumber(fields.curse.value) then return nil end
+  if pointer(manager+0x38)~=map or pointer(map+0x20)~=dict or pointer(dict+0x18)~=entries
+    or readInteger(dict+0x20)~=count or readInteger(dict+0x2C)~=version then M.cache={}; return nil end
+  return fields
+end
 function M.readFields(manager, force)
+  if M.discovery=='runtime' then return M.readRuntimeFields(manager,force) end
   if not manager or pointer(manager)~=M.klass then return nil end
   local L=M.build.layout
   local map=pointer(manager+L.managerMap)
   if map==0 or not classIs(pointer(map),'SerializableLiteralStringMap','Naninovel') then return nil end
   if not fieldOffsetsAgree(pointer(map),{dictionary=L.mapDictionary}) then return nil end
   local dict=pointer(map+L.mapDictionary)
-  if dict==0 or not classIs(pointer(dict),'Dictionary`2','System.Collections.Generic') then return nil end
+  if dict==0 or not classInherits(pointer(dict),'Dictionary`2','System.Collections.Generic') then return nil end
   if not fieldOffsetsAgree(pointer(dict),{_entries=L.dictEntries,_count=L.dictCount,_version=L.dictVersion}) then return nil end
   local entries=pointer(dict+L.dictEntries)
   local count=readInteger(dict+L.dictCount)
@@ -418,15 +605,17 @@ function M.readFields(manager, force)
   return fields
 end
 function M.locate()
-  local classes={}
-  for _,rva in ipairs(M.build.typeInfoCandidates) do
-    local klass=pointer(M.base+rva)
-    if classIs(klass,'CustomVariableManager','Naninovel') then classes[klass]=true end
+  if M.discovery~='runtime' then
+    local classes={}
+    for _,rva in ipairs(M.build.typeInfoCandidates) do
+      local klass=pointer(M.base+rva)
+      if classIs(klass,'CustomVariableManager','Naninovel') then classes[klass]=true end
+    end
+    local klass,count=nil,0
+    for k in pairs(classes) do klass=k; count=count+1 end
+    if count~=1 then error('Expected one initialized CustomVariableManager class, found '..count..'. Load a save first.') end
+    M.klass=klass
   end
-  local klass,count=nil,0
-  for k in pairs(classes) do klass=k; count=count+1 end
-  if count~=1 then error('Expected one initialized CustomVariableManager class, found '..count..'. Load a save first.') end
-  M.klass=klass
   if M.manager and M.readFields(M.manager,true) then return M.manager end
   local v=M.klass; local bytes={}
   for i=1,8 do bytes[i]=string.format('%02X', v &amp; 0xFF); v=v &gt;&gt; 8 end
@@ -661,25 +850,41 @@ function M.connect()
     if ok then M.timer.Enabled=true; return true end
   end
   if M.bridge then M.disconnect() end
-  M.connected=false; M.timer.Enabled=false; M.manager=nil; M.cache={}; M.build=nil
+  M.connected=false; M.timer.Enabled=false; M.manager=nil; M.cache={}; M.build=nil; M.klass=nil; M.discovery=nil
   local pid=getOpenedProcessID()
   local mod=gameModule()
-  -- Respect an already attached instance; metadata validation identifies the game.
+  -- Respect an already attached instance; named metadata identifies the game.
   if not pid or pid==0 or not mod then
     pid=getProcessIDFromProcessName('Annihilated.exe')
     if not pid or pid==0 then error('Start Annihilated through Steam and load a save first.') end
     openProcess(pid); mod=gameModule()
   end
-  if not mod then error('GameAssembly.dll is unavailable. Attach to the Proton game process and check CE memory access.') end
+  if not mod then error('GameAssembly.dll is unavailable. Select the game process in CE and check memory access.') end
+  if not targetIs64Bit() then error('This table requires the 64-bit game.') end
   M.pid=pid; M.base=mod.Address or getAddressSafe('GameAssembly.dll')
   if not M.base then error('GameAssembly.dll has not loaded yet.') end
-  M.status('Resolving IL2CPP methods from the installed game files...')
-  local build=Resolver.resolve(M.base,mod.PathToFile)
-  M.build=build
-  UPDATE,SETTER,STRING_NEW,SANITY_FILTER=build.update,build.setter,build.stringNew,build.sanityFilter
-  M.manager=M.locate(); M.ordered={}; M.lastWrite=nil; M.refresh(true)
+  M.ordered={}; M.lastWrite=nil; M.metadataFailure=nil
+  M.status('Finding game addresses. Please wait...')
+  local ok,reason=pcall(function()
+    M.build=Resolver.resolve(M.base,mod.PathToFile)
+    M.discovery='metadata'
+    local build=M.build
+    UPDATE,SETTER,STRING_NEW,SANITY_FILTER=build.update,build.setter,build.stringNew,build.sanityFilter
+    M.manager=M.locate(); M.refresh(true)
+  end)
+  if not ok then
+    M.metadataFailure=tostring(reason)
+    M.manager=nil; M.cache={}; M.build=nil; M.klass=nil; M.discovery=nil
+    local found,why=pcall(function()
+      M.discoverRuntime()
+      M.manager=M.locate(); M.verifyContainers(M.manager); M.refresh(true)
+    end)
+    if not found then
+      error('Automatic discovery failed. No write handler was installed.\nGame files: '..M.metadataFailure..'\nRuntime: '..tostring(why))
+    end
+  end
   M.connected=true; M.timer.Enabled=true
-  M.status('Connected (PID '..pid..', IL2CPP v'..build.version..', addresses resolved automatically).')
+  M.status('Connected (PID '..pid..'). Game addresses found automatically.')
   return true
 end
 function M.requestWrite(name,input)
@@ -776,7 +981,7 @@ label('Load a save &gt; Connect &gt; Select a field &gt; Apply',16,14,600)
 button('1. Connect',16,44,140,M.connect)
 button('Rescan',168,44,120,function()
   M.checkProcess(); if M.pending then error('Wait for the pending write to finish.') end
-  M.manager=nil; M.cache={}; M.lastWrite=nil; M.manager=M.locate(); M.refresh(true); M.status('Located HP, sanity and curse fields in the current save.')
+  M.manager=nil; M.cache={}; M.lastWrite=nil; M.manager=M.locate(); if M.discovery=='runtime' then M.verifyContainers(M.manager) end; M.refresh(true); M.status('Located HP, sanity and curse fields in the current save.')
 end)
 button('Disconnect',300,44,90,M.disconnect)
 local list=createListView(form); M.list=list
