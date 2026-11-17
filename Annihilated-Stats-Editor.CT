@@ -10,7 +10,283 @@ AnnihilatedHP.show()
 [DISABLE]
 </AssemblerScript></CheatEntry>
 </CheatEntries>
-<LuaScript>-- Annihilated: select verified IL2CPP addresses for the installed game build.
+<LuaScript>-- Read-only IL2CPP v39 resolver. No remote threads, runtime API calls or RVA list.
+-- Addresses are derived from the installed PE and its adjacent metadata file.
+AnnihilatedResolver = (function()
+  local R = {}
+  local function fail(s) error('IL2CPP resolver: '..s, 0) end
+  local function need(ok,s) if not ok then fail(s) end end
+  local function uint(s,p,n)
+    need(p&gt;=0 and p+n&lt;=#s, 'truncated or invalid binary offset')
+    return string.unpack('&lt;I'..n,s,p+1)
+  end
+  local function cstr(s,p,limit)
+    need(p&gt;=0 and p&lt;#s, 'invalid string offset')
+    local e=s:find('\0',p+1,true)
+    need(e and e-p&lt;=(limit or 4096), 'unterminated string')
+    return s:sub(p+1,e-1)
+  end
+  local function matches(s,pattern,alignment)
+    local out,p={},1
+    while true do
+      local i=s:find(pattern,p,true); if not i then break end
+      if not alignment or (i-1)%alignment==0 then out[#out+1]=i-1 end
+      p=i+1
+    end
+    return out
+  end
+  local function unique(values,label)
+    need(#values==1,label..': expected one match, found '..#values)
+    return values[1]
+  end
+  local function width(count) return count&lt;0xFF and 1 or (count&lt;0xFFFF and 2 or 4) end
+  local function peFile(s)
+    need(s:sub(1,2)=='MZ','GameAssembly.dll is not a PE file')
+    local h=uint(s,0x3C,4)
+    need(s:sub(h+1,h+4)=='PE\0\0' and uint(s,h+4,2)==0x8664,'expected x86-64 PE')
+    local n,opt=uint(s,h+6,2),h+24
+    need(uint(s,opt,2)==0x20B and n&gt;0 and n&lt;100,'unsupported PE header')
+    local P={data=s,base=uint(s,opt+24,8),size=uint(s,opt+56,4),
+      stamp=uint(s,h+8,4),header=h,sections={}}
+    local first=opt+uint(s,h+20,2)
+    for i=0,n-1 do
+      local p=first+40*i
+      P.sections[#P.sections+1]={rva=uint(s,p+12,4),size=uint(s,p+16,4),
+        raw=uint(s,p+20,4),flags=uint(s,p+36,4)}
+    end
+    function P.raw(rva)
+      for _,v in ipairs(P.sections) do
+        if rva&gt;=v.rva and rva&lt;v.rva+v.size then return v.raw+rva-v.rva end
+      end
+      fail('unmapped PE RVA '..string.format('%X',rva))
+    end
+    function P.rva(raw)
+      for _,v in ipairs(P.sections) do
+        if raw&gt;=v.raw and raw&lt;v.raw+v.size then return v.rva+raw-v.raw end
+      end
+      fail('unmapped PE file offset')
+    end
+    function P.ptr(va) return uint(s,P.raw(va-P.base),8) end
+    function P.executable(rva)
+      for _,v in ipairs(P.sections) do
+        if rva&gt;=v.rva and rva&lt;v.rva+v.size then return v.flags &amp; 0x20000000 ~= 0 end
+      end
+      return false
+    end
+    function P.export(name)
+      local er,es=uint(s,opt+112,4),uint(s,opt+116,4)
+      need(er&gt;0,'missing PE exports')
+      local e=P.raw(er); local count=uint(s,e+24,4)
+      need(count&lt;100000,'invalid export table')
+      local names,ord,func=P.raw(uint(s,e+32,4)),P.raw(uint(s,e+36,4)),P.raw(uint(s,e+28,4))
+      local found={}
+      for i=0,count-1 do
+        if cstr(s,P.raw(uint(s,names+4*i,4)))==name then
+          local ordinal=uint(s,ord+2*i,2)
+          need(ordinal&lt;uint(s,e+20,4),'invalid export ordinal')
+          local rva=uint(s,func+4*ordinal,4)
+          need(not(rva&gt;=er and rva&lt;er+es) and P.executable(rva),'forwarded or invalid '..name)
+          found[#found+1]=rva
+        end
+      end
+      return unique(found,'export '..name)
+    end
+    return P
+  end
+  local function metadata(s)
+    need(uint(s,0,4)==0xFAB11BAF,'invalid metadata magic')
+    local version=uint(s,4,4)
+    need(version==39,'unsupported metadata version '..version..' (supported: 39); no game memory changed')
+    local function section(p)
+      local off,size,count=uint(s,p,4),uint(s,p+4,4),uint(s,p+8,4)
+      need(off+size&lt;=#s and (p==32 or count==0 or size%count==0),'invalid metadata section')
+      return {off=off,size=size,count=count,stride=count&gt;0 and size//count or 0}
+    end
+    local S={strings=section(32),methods=section(68),fields=section(140),
+      generic=section(176),interfaces=section(224),types=section(236),images=section(248),params=section(128)}
+    local tw,dw,gw,pw=S.interfaces.stride-4,width(S.types.count),width(S.generic.count),width(S.params.count)
+    need(tw==1 or tw==2 or tw==4,'unsupported type index width')
+    need(S.types.stride==68+3*tw+gw and S.methods.stride==20+dw+tw+pw+gw and
+      S.fields.stride==8+tw and S.images.stride==32+2*dw,'unsupported v39 record layout')
+    local M={version=version,types={},sections=S}
+    function M.str(i)
+      need(i&lt;S.strings.size,'invalid metadata string index')
+      return cstr(s,S.strings.off+i)
+    end
+    for i=0,S.types.count-1 do
+      local p=S.types.off+i*S.types.stride
+      local starts=p+12+3*tw+gw
+      local counts=starts+32
+      M.types[i]={index=i,name=M.str(uint(s,p,4)),namespace=M.str(uint(s,p+4,4)),
+        byval=uint(s,p+8,tw),fieldStart=uint(s,starts,4),methodStart=uint(s,starts+4,4),
+        methodCount=uint(s,counts,2),fieldCount=uint(s,counts+4,2)}
+    end
+    for i=0,S.images.count-1 do
+      local p=S.images.off+i*S.images.stride
+      local name=M.str(uint(s,p,4)); local start,count=uint(s,p+8,dw),uint(s,p+8+dw,4)
+      need(start+count&lt;=S.types.count,'invalid image type range')
+      for j=start,start+count-1 do M.types[j].image=name end
+    end
+    function M.type(image,ns,name)
+      local found={}
+      for _,t in pairs(M.types) do
+        if t.image==image and t.namespace==ns and t.name==name then found[#found+1]=t end
+      end
+      return unique(found,'type '..ns..'.'..name)
+    end
+    function M.method(t,name,argc)
+      local found={}
+      for i=t.methodStart,t.methodStart+t.methodCount-1 do
+        need(i&lt;S.methods.count,'invalid method range')
+        local p=S.methods.off+i*S.methods.stride
+        if M.str(uint(s,p,4))==name and uint(s,p+S.methods.stride-2,2)==argc then
+          need(uint(s,p+4,dw)==t.index,'method owner mismatch')
+          found[#found+1]={name=name,token=uint(s,p+S.methods.stride-12,4)}
+        end
+      end
+      return unique(found,'method '..t.name..'.'..name)
+    end
+    function M.fields(t)
+      local out={}
+      for i=0,t.fieldCount-1 do
+        need(t.fieldStart+i&lt;S.fields.count,'invalid field range')
+        local p=S.fields.off+(t.fieldStart+i)*S.fields.stride
+        out[#out+1]={name=M.str(uint(s,p,4)),index=i,type=uint(s,p+4,tw)}
+      end
+      return out
+    end
+    return M
+  end
+  function R.fromData(binary,meta)
+    local P,M=peFile(binary),metadata(meta)
+    local runtime='Elringus.Naninovel.Runtime.dll'
+    local manager=M.type(runtime,'Naninovel','CustomVariableManager')
+    local behaviour=M.type(runtime,'Naninovel','RuntimeBehaviour')
+    local filter=M.type('Assembly-CSharp.dll','','CustomVariablePostProcessorService')
+    local result={version=M.version,stamp=P.stamp,imageSize=P.size,peHeader=P.header,checks={},layout={}}
+    local modules={}
+    local function method(t,name,argc)
+      local token=M.method(t,name,argc).token; local rid=token &amp; 0xFFFFFF
+      need(token&gt;&gt;24==6 and rid&gt;0,'invalid method token')
+      if not modules[t.image] then
+        local candidates={}
+        for _,pos in ipairs(matches(binary,t.image..'\0')) do
+          local ok,rva=pcall(P.rva,pos)
+          if ok then
+            for _,at in ipairs(matches(binary,string.pack('&lt;I8',P.base+rva),8)) do
+              local valid,module=pcall(function()
+                local count=uint(binary,at+8,8); local tableVA=uint(binary,at+16,8)
+                need(count&gt;=rid and count&lt;1000000,'invalid codegen module')
+                P.raw(tableVA-P.base); P.raw(tableVA-P.base+8*(count-1))
+                return {raw=at,count=count,tableVA=tableVA}
+              end)
+              if valid then candidates[#candidates+1]=module end
+            end
+          end
+        end
+        modules[t.image]=unique(candidates,'codegen module '..t.image)
+      end
+      local mod=modules[t.image]; need(rid&lt;=mod.count,'method token exceeds module table')
+      local tableRVA=mod.tableVA-P.base+8*(rid-1)
+      local address=uint(binary,P.raw(tableRVA),8)-P.base
+      need(P.executable(address),'method has no executable implementation: '..name)
+      result.checks[#result.checks+1]={rva=tableRVA,pointerRVA=address}
+      return address
+    end
+    result.update=method(behaviour,'Update',0)
+    result.setter=method(manager,'SetVariableValue',2)
+    result.sanityFilter=method(filter,'NormalizeFixedPartnerSanityValue',2)
+    result.stringNew=P.export('il2cpp_string_new')
+    result.typeInfoCandidates={}
+    for _,raw in ipairs(matches(binary,string.pack('&lt;I8',0x20000001 | (manager.byval&lt;&lt;1)),8)) do
+      local ok,rva=pcall(P.rva,raw)
+      if ok then result.typeInfoCandidates[#result.typeInfoCandidates+1]=rva end
+    end
+    need(#result.typeInfoCandidates&gt;0,'missing CustomVariableManager type-info usage')
+    -- Verify native field offsets from MetadataRegistration, not a build-specific RVA.
+    local regs={}
+    for _,raw in ipairs(matches(binary,string.pack('&lt;I8',M.sections.types.count),8)) do
+      if raw&gt;=80 and raw+32&lt;=#binary and uint(binary,raw+16,8)==M.sections.types.count then
+        local ok,reg=pcall(function()
+          local typesCount=uint(binary,raw-32,8)
+          local typesVA=uint(binary,raw-24,8); local offsetsVA=uint(binary,raw+8,8)
+          need(typesCount&gt;manager.byval and typesCount&lt;1000000,'invalid registration count')
+          P.raw(typesVA-P.base); P.raw(offsetsVA-P.base)
+          local it=P.ptr(typesVA+manager.byval*8)
+          need(P.ptr(it)==manager.index and (uint(binary,P.raw(it-P.base)+8,4)&gt;&gt;16)&amp;255==0x12,'type registration mismatch')
+          return {types=typesVA,offsets=offsetsVA}
+        end)
+        if ok then regs[#regs+1]=reg end
+      end
+    end
+    local reg=unique(regs,'metadata registration')
+    local function field(t,name)
+      local found={}
+      for _,f in ipairs(M.fields(t)) do if f.name==name then found[#found+1]=f end end
+      local f=unique(found,'field '..t.name..'.'..name)
+      local offsets=P.ptr(reg.offsets+t.index*8)
+      return uint(binary,P.raw(offsets-P.base)+f.index*4,4)
+    end
+    result.layout.managerMap=field(manager,'localVariableMap')
+    result.layout.managerPreview=field(manager,'readOnlyEvaluationValues')
+    need(result.layout.managerMap&gt;=16 and result.layout.managerMap&lt;0x1000 and result.layout.managerMap%8==0 and
+      result.layout.managerPreview&gt;=16 and result.layout.managerPreview&lt;0x1000 and result.layout.managerPreview%8==0,
+      'unsupported manager field layout')
+    local str=M.type('mscorlib.dll','System','String')
+    need(field(str,'_stringLength')==0x10 and field(str,'_firstChar')==0x14,'unsupported string layout')
+    -- Generic templates do not contain inflated field offsets. Verify the schema,
+    -- then validate the actual objects/array stride before accepting a manager.
+    local function schema(t,expected)
+      local actual={}; for _,f in ipairs(M.fields(t)) do actual[#actual+1]=f.name end
+      need(table.concat(actual,',')==expected,'unsupported generic layout: '..t.name)
+    end
+    schema(M.type(runtime,'Naninovel','SerializableMap`2'),'keys,values,dictionary')
+    schema(M.type('mscorlib.dll','System.Collections.Generic','Dictionary`2'),
+      '_buckets,_entries,_count,_freeList,_freeCount,_version,_comparer,_keys,_values,_syncRoot')
+    result.layout.mapDictionary=0x20; result.layout.dictEntries=0x18
+    result.layout.dictCount=0x20; result.layout.dictVersion=0x2C; result.layout.entrySize=24
+    -- Match only exact x64 hook instructions that our trampoline replays.
+    local function check(rva,bytes,label)
+      local raw=P.raw(rva)
+      need(binary:sub(raw+1,raw+#bytes)==bytes,'unsupported '..label..' prologue; no hook installed')
+    end
+    check(result.update,'\x48\x8B\x49\x20\x48\x85\xC9','Update')
+    check(result.sanityFilter,'\x48\x89\x5C\x24\x08','sanity filter')
+    for _,key in ipairs({'update','setter','stringNew','sanityFilter'}) do
+      local rva=result[key]; local raw=P.raw(rva)
+      result.checks[#result.checks+1]={rva=rva,bytes=binary:sub(raw+1,raw+16)}
+    end
+    return result
+  end
+  function R.resolve(base,modulePath)
+    need(type(modulePath)=='string' and #modulePath&gt;0,'module file path unavailable; attach locally to the Proton game')
+    local function read(path)
+      local f,err=io.open(path,'rb'); need(f~=nil,'cannot open '..path..': '..tostring(err))
+      local s=f:read('*a'); f:close(); need(s~=nil,'cannot read '..path); return s
+    end
+    local dir=modulePath:match('^(.*[/\\])')
+    need(dir~=nil,'module path must be absolute')
+    local sep=dir:find('\\',1,true) and '\\' or '/'
+    local metaPath=dir..table.concat({'Annihilated_Data','il2cpp_data','Metadata','global-metadata.dat'},sep)
+    local result=R.fromData(read(modulePath),read(metaPath))
+    local function live(rva,n)
+      local bytes=readBytes(base+rva,n,true)
+      need(bytes and #bytes==n,'cannot read target memory; check process access')
+      return string.char(table.unpack(bytes))
+    end
+    need(uint(live(result.peHeader+8,4),0,4)==result.stamp and
+      uint(live(result.peHeader+24+56,4),0,4)==result.imageSize,'disk DLL and running game differ; restart the game')
+    for _,c in ipairs(result.checks) do
+      if c.bytes then need(live(c.rva,#c.bytes)==c.bytes,'live code differs from disk; disconnect other hooks/restart the game')
+      else need(uint(live(c.rva,8),0,8)==base+c.pointerRVA,'live method table differs from disk') end
+    end
+    result.modulePath=modulePath
+    return result
+  end
+  return R
+end)()
+
+-- Annihilated: resolve named IL2CPP methods for the installed game build.
 -- Embedded in the .CT; no external Lua file is needed by the delivered table.
 -- Only the main-thread bridge calls SetVariableValue. No string is edited in place.
 if AnnihilatedHP then
@@ -20,17 +296,8 @@ if AnnihilatedHP then
 end
 local M = { fields={}, ordered={}, cache={}, connected=false }
 AnnihilatedHP = M
-local BUILDS = {
-  ['bd28a4a7603095fd41ab81c2a0929e54'] = {
-    update=0xAB7E50, setter=0xAA7460, stringNew=0x42EB30,
-    typeInfo=0x4153C08, sanityFilter=0x55FCE0
-  },
-  ['e717e54e131f65fdecef8a98e6f0ee29'] = {
-    update=0xAD5CB0, setter=0xAC52C0, stringNew=0x4315E0,
-    typeInfo=0x41816C0, sanityFilter=0x5731C0
-  }
-}
-local UPDATE, SETTER, STRING_NEW, TYPEINFO, SANITY_FILTER
+local Resolver = AnnihilatedResolver
+local UPDATE, SETTER, STRING_NEW, SANITY_FILTER
 local SANITY_ORIGINAL = {0x48,0x89,0x5C,0x24,0x08}
 local ORIGINAL = {0x48,0x8B,0x49,0x20,0x48,0x85,0xC9}
 local function hex(n) return string.format('%X', n) end
@@ -59,43 +326,107 @@ local function order(s)
   return known[s] or (10+tonumber(s:match('enemy(%d+)'))*2+(s:find('Max') and 1 or 0))
 end
 function M.status(s) M.message=s; if M.statusLabel then M.statusLabel.Caption=s end end
-function M.checkProcess()
-  if not M.pid or getOpenedProcessID()~=M.pid or getProcessIDFromProcessName('Annihilated.exe')~=M.pid then
-    error('The game exited or CE switched targets. Reconnect to Annihilated.exe.')
+local function gameModule()
+  for _,mod in ipairs(enumModules()) do
+    local name=(mod.Name or mod.PathToFile or ''):gsub('\\','/'):match('([^/]+)$')
+    if name and name:lower()=='gameassembly.dll' then return mod end
   end
 end
-function M.readFields(manager, force)
-  if pointer(manager)~=M.klass then return nil end
-  local map=pointer(manager+0x38)
-  local dict=map~=0 and pointer(map+0x20) or 0
-  local entries=dict~=0 and pointer(dict+0x18) or 0
-  local count=dict~=0 and readInteger(dict+0x20) or nil
-  if entries==0 or not count or count&lt;1 or count&gt;20000 then return nil end
-  local capacity=pointer(entries+0x18)
-  if capacity&lt;count or capacity&gt;50000 then return nil end
-  local version=readInteger(dict+0x2C)
-  -- Re-enumerate keys after load, resize or dictionary mutation.
-  if force or M.cache.entries~=entries or M.cache.version~=version or M.cache.manager~=manager then
-    local fields={}
-    for i=0,count-1 do
-      local at=entries+0x20+i*24
-      local hash=readInteger(at)
-      if hash and hash&lt;0x80000000 then
-        local keyPtr=pointer(at+8)
-        local key=text(keyPtr)
-        if fieldName(key) then fields[key]={name=key,index=i,key=keyPtr,slot=at+16} end
+local function classIs(klass,name,namespace)
+  return klass&gt;=0x10000 and readString(pointer(klass+0x10),128,false)==name
+    and readString(pointer(klass+0x18),128,false)==namespace
+end
+function M.checkProcess()
+  if not M.pid or getOpenedProcessID()~=M.pid then
+    error('CE switched targets. Reconnect to Annihilated.exe.')
+  end
+  local mod=gameModule()
+  if not mod or mod.Address~=M.base or not M.build
+    or readInteger(M.base+M.build.peHeader+8)~=M.build.stamp
+    or readInteger(M.base+M.build.peHeader+24+56)~=M.build.imageSize then
+    error('The game exited or its module changed. Reconnect to Annihilated.exe.')
+  end
+end
+-- Metadata v39 has this class/FieldInfo layout. If reflection fields are already
+-- populated, cross-check the inflated generic offsets as well as object contents.
+local function fieldOffsetsAgree(klass,expected)
+  local remaining={}; for name,offset in pairs(expected) do remaining[name]=offset end
+  for depth=1,8 do
+    if klass==0 then break end
+    local fields=pointer(klass+0x80)
+    local count=readSmallInteger(klass+0x124)
+    if fields~=0 and count and count&gt;=0 and count&lt;1000 then
+      for i=0,count-1 do
+        local f=fields+i*0x20
+        local name=readString(pointer(f),128,false)
+        if name and remaining[name] then
+          if readInteger(f+0x18)~=remaining[name] then return false end
+          remaining[name]=nil
+        end
       end
     end
-    M.cache={entries=entries,version=version,manager=manager,fields=fields}
+    klass=pointer(klass+0x58)
+  end
+  -- IL2CPP may initialize reflection metadata lazily. In that case the resolver's
+  -- declared-field schema plus class/stride/content checks below are mandatory.
+  return true
+end
+function M.readFields(manager, force)
+  if not manager or pointer(manager)~=M.klass then return nil end
+  local L=M.build.layout
+  local map=pointer(manager+L.managerMap)
+  if map==0 or not classIs(pointer(map),'SerializableLiteralStringMap','Naninovel') then return nil end
+  if not fieldOffsetsAgree(pointer(map),{dictionary=L.mapDictionary}) then return nil end
+  local dict=pointer(map+L.mapDictionary)
+  if dict==0 or not classIs(pointer(dict),'Dictionary`2','System.Collections.Generic') then return nil end
+  if not fieldOffsetsAgree(pointer(dict),{_entries=L.dictEntries,_count=L.dictCount,_version=L.dictVersion}) then return nil end
+  local entries=pointer(dict+L.dictEntries)
+  local count=readInteger(dict+L.dictCount)
+  if entries==0 or not count or count&lt;1 or count&gt;20000 then return nil end
+  local capacity=pointer(entries+0x18)
+  if capacity&lt;count or capacity&gt;50000 or readInteger(pointer(entries)+0x104)~=L.entrySize then return nil end
+  local version=readInteger(dict+L.dictVersion)
+  if version==nil then return nil end
+  if force or M.cache.dict~=dict or M.cache.entries~=entries or M.cache.count~=count
+    or M.cache.version~=version or M.cache.manager~=manager then
+    local fields={}
+    for i=0,count-1 do
+      local at=entries+0x20+i*L.entrySize
+      local hash=readInteger(at)
+      if hash and hash&gt;=0 and hash&lt;0x80000000 then
+        local keyPtr=pointer(at+8)
+        local key=text(keyPtr)
+        if fieldName(key) then
+          if fields[key] then return nil end
+          fields[key]={name=key,index=i,key=keyPtr,slot=at+16}
+        end
+      end
+    end
+    M.cache={dict=dict,entries=entries,count=count,version=version,manager=manager,fields=fields}
   end
   local fields=M.cache.fields
   if not fields.playerHealth then return nil end
-  for _,f in pairs(fields) do f.object=pointer(f.slot); f.value=text(f.object) end
+  for _,f in pairs(fields) do
+    if pointer(f.slot-8)~=f.key or text(f.key)~=f.name then M.cache={}; return nil end
+    f.object=pointer(f.slot); f.value=text(f.object)
+  end
+  -- Unused enemy/optional variables can legitimately contain an empty string.
+  if not tonumber(fields.playerHealth.value) then return nil end
+  if pointer(manager+L.managerMap)~=map or pointer(map+L.mapDictionary)~=dict
+    or pointer(dict+L.dictEntries)~=entries or readInteger(dict+L.dictCount)~=count
+    or readInteger(dict+L.dictVersion)~=version then M.cache={}; return nil end
   return fields
 end
 function M.locate()
-  M.klass=pointer(M.base+TYPEINFO)
-  if M.klass&lt;0x10000 then error('Variables are not initialized. Load a save first.') end
+  local classes={}
+  for _,rva in ipairs(M.build.typeInfoCandidates) do
+    local klass=pointer(M.base+rva)
+    if classIs(klass,'CustomVariableManager','Naninovel') then classes[klass]=true end
+  end
+  local klass,count=nil,0
+  for k in pairs(classes) do klass=k; count=count+1 end
+  if count~=1 then error('Expected one initialized CustomVariableManager class, found '..count..'. Load a save first.') end
+  M.klass=klass
   if M.manager and M.readFields(M.manager,true) then return M.manager end
   local v=M.klass; local bytes={}
   for i=1,8 do bytes[i]=string.format('%02X', v &amp; 0xFF); v=v &gt;&gt; 8 end
@@ -105,10 +436,10 @@ function M.locate()
   for i=0,found.Count-1 do
     local at=tonumber(found[i],16)
     local ok,fields=pcall(M.readFields,at,true)
-    if ok and fields and tonumber(fields.playerHealth.value) then candidates[#candidates+1]=at end
+    if ok and fields then candidates[#candidates+1]=at end
   end
-  found.destroy()
-  if #candidates~=1 then error('Found '..#candidates..' valid variable maps. Load a save and reconnect.') end
+  found.destroy(); M.cache={}
+  if #candidates~=1 then error('Found '..#candidates..' valid variable maps. Load a save and try Rescan.') end
   return candidates[1]
 end
 function M.installBridge()
@@ -136,6 +467,10 @@ label(anhp_manager)
 label(anhp_class)
 label(anhp_key)
 label(anhp_text)
+label(anhp_dict)
+label(anhp_entries)
+label(anhp_keyslot)
+label(anhp_value)
 label(anhp_sanity_override)
 label(anhp_sanity_hook)
 label(anhp_sanity_original)
@@ -144,6 +479,10 @@ registersymbol(anhp_manager)
 registersymbol(anhp_class)
 registersymbol(anhp_key)
 registersymbol(anhp_text)
+registersymbol(anhp_dict)
+registersymbol(anhp_entries)
+registersymbol(anhp_keyslot)
+registersymbol(anhp_value)
 registersymbol(anhp_sanity_override)
 anhp_bridge:
   pushfq
@@ -173,12 +512,26 @@ anhp_bridge:
   mov rax,[anhp_class]
   cmp [rcx],rax
   jne anhp_failure
-  cmp qword ptr [rcx+40],0
+  cmp qword ptr [rcx+%X],0
+  jne anhp_failure
+  mov rax,[rcx+%X]
+  test rax,rax
+  je anhp_failure
+  mov rax,[rax+%X]
+  cmp rax,[anhp_dict]
+  jne anhp_failure
+  mov rax,[rax+%X]
+  cmp rax,[anhp_entries]
+  jne anhp_failure
+  mov rax,[anhp_keyslot]
+  mov rdx,[anhp_key]
+  cmp [rax],rdx
   jne anhp_failure
   lea rcx,[anhp_text]
   call newstring
   test rax,rax
   je anhp_failure
+  mov [anhp_value],rax
   mov r8,rax
   mov rcx,[anhp_manager]
   mov rdx,[anhp_key]
@@ -218,6 +571,8 @@ anhp_sanity_hook:
   jne anhp_sanity_original
   cmp rdx,[anhp_key]
   jne anhp_sanity_original
+  cmp r8,[anhp_value]
+  jne anhp_sanity_original
   popfq
   mov rax,r8
   ret
@@ -236,6 +591,14 @@ anhp_manager:
 anhp_class:
   dq 0
 anhp_key:
+  dq 0
+anhp_dict:
+  dq 0
+anhp_entries:
+  dq 0
+anhp_keyslot:
+  dq 0
+anhp_value:
   dq 0
 anhp_text:
   db 0
@@ -256,13 +619,17 @@ unregistersymbol(anhp_manager)
 unregistersymbol(anhp_class)
 unregistersymbol(anhp_key)
 unregistersymbol(anhp_text)
+unregistersymbol(anhp_dict)
+unregistersymbol(anhp_entries)
+unregistersymbol(anhp_keyslot)
+unregistersymbol(anhp_value)
 unregistersymbol(anhp_sanity_override)
-]]):format(hex(M.base+UPDATE),hex(M.base+SETTER),hex(M.base+STRING_NEW),hex(M.base+SANITY_FILTER))
+]]):format(hex(M.base+UPDATE),hex(M.base+SETTER),hex(M.base+STRING_NEW),hex(M.base+SANITY_FILTER),M.build.layout.managerPreview,M.build.layout.managerMap,M.build.layout.mapDictionary,M.build.layout.dictEntries)
   local ok,di=autoAssemble(asm)
   if not ok then error('Could not install the write handler: '..tostring(di)) end
   M.bridge={pid=M.pid,asm=asm,di=di,patch=readBytes(M.base+UPDATE,7,true),sanityPatch=readBytes(M.base+SANITY_FILTER,5,true),
     state=getAddress('anhp_state'),manager=getAddress('anhp_manager'),klass=getAddress('anhp_class'),
-    key=getAddress('anhp_key'),buffer=getAddress('anhp_text'),sanityOverride=getAddress('anhp_sanity_override')}
+    key=getAddress('anhp_key'),dict=getAddress('anhp_dict'),entries=getAddress('anhp_entries'),keyslot=getAddress('anhp_keyslot'),buffer=getAddress('anhp_text'),sanityOverride=getAddress('anhp_sanity_override')}
 end
 function M.refresh(force)
   M.checkProcess()
@@ -289,24 +656,30 @@ function M.refresh(force)
   return fields
 end
 function M.connect()
-  local pid=getProcessIDFromProcessName('Annihilated.exe')
-  if not pid or pid==0 then error('Start Annihilated.exe and load a save first.') end
-  if M.connected and pid==M.pid and getOpenedProcessID()==pid then M.refresh(true); M.timer.Enabled=true; return true end
+  if M.connected then
+    local ok=pcall(function() M.checkProcess(); M.refresh(true) end)
+    if ok then M.timer.Enabled=true; return true end
+  end
   if M.bridge then M.disconnect() end
-  openProcess(pid)
-  M.pid=pid; M.base=getAddressSafe('GameAssembly.dll')
+  M.connected=false; M.timer.Enabled=false; M.manager=nil; M.cache={}; M.build=nil
+  local pid=getOpenedProcessID()
+  local mod=gameModule()
+  -- Respect an already attached instance; metadata validation identifies the game.
+  if not pid or pid==0 or not mod then
+    pid=getProcessIDFromProcessName('Annihilated.exe')
+    if not pid or pid==0 then error('Start Annihilated through Steam and load a save first.') end
+    openProcess(pid); mod=gameModule()
+  end
+  if not mod then error('GameAssembly.dll is unavailable. Attach to the Proton game process and check CE memory access.') end
+  M.pid=pid; M.base=mod.Address or getAddressSafe('GameAssembly.dll')
   if not M.base then error('GameAssembly.dll has not loaded yet.') end
-  local modulePath
-  for _,mod in ipairs(enumModules()) do if mod.Name:lower()=='gameassembly.dll' then modulePath=mod.PathToFile end end
-  local buildHash=modulePath and md5file(modulePath):lower()
-  local build=buildHash and BUILDS[buildHash]
-  if not build then error('This table does not match the installed game version. Connection stopped.') end
-  UPDATE,SETTER,STRING_NEW,TYPEINFO,SANITY_FILTER=build.update,build.setter,build.stringNew,build.typeInfo,build.sanityFilter
-  M.build=build; M.buildHash=buildHash
-  if not sameBytes(M.base+SETTER,{0x40,0x53,0x55,0x41,0x54,0x41,0x57,0x48,0x83,0xEC,0x28}) then error('Write function verification failed.') end
+  M.status('Resolving IL2CPP methods from the installed game files...')
+  local build=Resolver.resolve(M.base,mod.PathToFile)
+  M.build=build
+  UPDATE,SETTER,STRING_NEW,SANITY_FILTER=build.update,build.setter,build.stringNew,build.sanityFilter
   M.manager=M.locate(); M.ordered={}; M.lastWrite=nil; M.refresh(true)
   M.connected=true; M.timer.Enabled=true
-  M.status('Connected to Annihilated.exe (PID '..pid..'). Select a field and enter a value.')
+  M.status('Connected (PID '..pid..', IL2CPP v'..build.version..', addresses resolved automatically).')
   return true
 end
 function M.requestWrite(name,input)
@@ -320,12 +693,13 @@ function M.requestWrite(name,input)
   value=string.format('%.0f',number)
   local fields=M.refresh(true); local f=fields[name]
   if not f or not fieldName(name) then error('This field is not available in the current state.') end
-  if pointer(M.manager+0x40)~=0 then error('The game is evaluating a preview. Try again shortly.') end
+  if pointer(M.manager+M.build.layout.managerPreview)~=0 then error('The game is evaluating a preview. Try again shortly.') end
   M.installBridge(); local b=M.bridge
   if readInteger(b.state)==2 then error('The game is processing the previous request. Try again shortly.') end
   put(writeInteger(b.state,0))
   put(writeInteger(b.sanityOverride,(name=='playerSanity' or name=='partnerSanity') and 1 or 0))
   put(writeQword(b.manager,M.manager)); put(writeQword(b.klass,M.klass)); put(writeQword(b.key,f.key))
+  put(writeQword(b.dict,M.cache.dict)); put(writeQword(b.entries,M.cache.entries)); put(writeQword(b.keyslot,f.slot-8))
   put(writeString(b.buffer,value,false)); put(writeBytes(b.buffer+#value,0))
   M.pending={name=name,before=f.value,desired=value,started=getTickCount()}
   put(writeInteger(b.state,1))
@@ -354,13 +728,21 @@ function M.poll()
   if M.testStep then M.testStep() end
 end
 function M.disconnect()
-  if M.bridge and getProcessIDFromProcessName('Annihilated.exe')~=M.bridge.pid then M.bridge=nil end
+  -- The game may have exited while CE stayed open or attached to its replacement.
+  -- Only discard the old bridge when a successful process listing proves it gone.
+  if M.bridge and type(getProcesslist)=='function' then
+    local ok,processes=pcall(getProcesslist)
+    if ok and type(processes)=='table' and next(processes)~=nil and not processes[M.bridge.pid] then
+      M.bridge=nil
+    end
+  end
+  if M.bridge and getOpenedProcessID()==M.bridge.pid and not gameModule() then M.bridge=nil end
   if M.bridge then
     if getOpenedProcessID()~=M.bridge.pid then error('Select Annihilated.exe in CE again before disconnecting the write handler.') end
     local state=readInteger(M.bridge.state)
     if state==1 or state==2 then error('A write is pending. Return to the game for a frame before disconnecting.') end
     if sameBytes(M.base+UPDATE,M.bridge.patch) and sameBytes(M.base+SANITY_FILTER,M.bridge.sanityPatch) then
-      local ok,err=autoAssemble(M.bridge.asm,M.bridge.di)
+      local ok,err=autoAssemble(M.bridge.asm,false,M.bridge.di)
       if not ok then error('Could not restore the game handler: '..tostring(err)) end
     elseif not sameBytes(M.base+UPDATE,ORIGINAL) or not sameBytes(M.base+SANITY_FILTER,SANITY_ORIGINAL) then error('A game handler was modified by another tool; its changes were not overwritten.') end
     M.bridge=nil
